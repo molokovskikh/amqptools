@@ -150,6 +150,7 @@ void print_help(const char *program_name) {
   fprintf(stderr, "  --exclusive            declare the queue as exclusive\n");
   fprintf(stderr, "  --durable              declare the queue should survive broker restart\n");
   fprintf(stderr, "  --no-ack               do not send acks to the server (WARNING: may cause data loss!)\n");
+  fprintf(stderr, "  --header/-H header     is name of message header wich value of need to get in program execute into last parameter\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Refer to the AMQP documentation for full explanation of the passive,\n");
   fprintf(stderr, "exclusive and durable options.\n");
@@ -157,7 +158,7 @@ void print_help(const char *program_name) {
   fprintf(stderr, "The following environment variables may also be set:\n");
   fprintf(stderr, "  AMQP_HOST, AMQP_PORT, AMQP_VHOST, AMQP_USER, AMQP_PASSWORD, AMQP_QUEUE\n");
   fprintf(stderr, "  AMQP_QUEUE_PASSIVE, AMQP_QUEUE_EXCLUSIVE, AMQP_QUEUE_DURABLE\n\n");
-  fprintf(stderr, "Program will be called with the following arguments: routing_key, tempfile\n");
+  fprintf(stderr, "Program will be called with the following arguments: routing_key, tempfile, message_id\n");
   fprintf(stderr, "   tempfile contains the raw bytestream of the message\n\n");
   fprintf(stderr, "If program is not supplied, the above format will be printed to stdout\n\n");
   fprintf(stderr, "Example:\n");
@@ -184,6 +185,7 @@ int main(int argc, char **argv) {
   char const *vhost = "/";
   char const *username = "guest";
   char const *password = "guest";
+  char const *header_to_program = "";
   char const *program = NULL;
   char const *program_args = "";
   amqp_bytes_t queue = AMQP_EMPTY_BYTES;
@@ -215,6 +217,8 @@ int main(int argc, char **argv) {
   if (NULL != getenv("AMQP_MSG_LIMIT"))
     msg_limit = atoi(getenv("AMQP_MSG_LIMIT"));
   msg_limit = msg_limit > 0 ? msg_limit : 0; // default to unlimited
+  if (NULL != getenv("AMQP_CUSTOM_HEADER"))
+    header_to_program = getenv("AMQP_CUSTOM_HEADER");
 
   while(1) {
     static struct option long_options[] =
@@ -233,11 +237,12 @@ int main(int argc, char **argv) {
       {"no-ack", no_argument, &no_ack, 1},
       {"execute", required_argument, 0, 'e'},
       {"queue", required_argument, 0, 'q'},
+      {"header", required_argument, 0, 'H'},
       {"help", no_argument, 0, '?'},
       {0, 0, 0, 0}
     };
     int option_index = 0;
-    c = getopt_long(argc, argv, "v:h:P:u:p:n:fe:q:?",
+    c = getopt_long(argc, argv, "v:h:P:u:p:n:fe:q:H:?",
                     long_options, &option_index);
     if(c == -1)
       break;
@@ -273,6 +278,9 @@ int main(int argc, char **argv) {
         break;
       case 'q':
         queue = amqp_cstring_bytes(optarg);
+        break;
+      case 'H':
+        header_to_program = optarg;
         break;
       case '?':
       default:
@@ -476,15 +484,42 @@ int main(int argc, char **argv) {
 
       close(tempfd);
 
-      {
+
+	  char* header_to_program_value = NULL;
+      for(int i=0; i<p->headers.num_entries; i++){
+        amqp_bytes_t key = p->headers.entries[i].key;
+		amqp_field_value_t	value = p->headers.entries[i].value;
+		if(value.kind==AMQP_FIELD_KIND_UTF8)
+        {
+		 amqp_bytes_t* value_h = (amqp_bytes_t*) &value.value;
+
+		 if(strlen(header_to_program)==key.len && strncmp(header_to_program,key.bytes,key.len)==0)
+         {
+		 header_to_program_value = (char *)calloc(1, value_h->len + 1);
+		 *header_to_program_value = '\0';
+		 strncpy(header_to_program_value, (char *)value_h->bytes, value_h->len);
+		 }
+        }
+      }
+
+
+      {  
         char *routekey = (char *)calloc(1, d->routing_key.len + 1);
         strncpy(routekey, (char *)d->routing_key.bytes, d->routing_key.len);
+
+        char *messageid = (char *)calloc(1, p->message_id.len + 1);
+		*messageid = '\0';
+        strncpy(messageid, (char *)p->message_id.bytes, p->message_id.len);
+
+        char *correlationid = (char *)calloc(1, p->correlation_id.len + 1);
+		*correlationid = '\0';
+        strncpy(correlationid, (char *)p->correlation_id.bytes, p->correlation_id.len);
 
         if(NULL != program) {
           // fork and run the program in the background
           pid_t pid = fork();
           if (pid == 0) {
-            if(execl(program, program, program_args, routekey, tempfile, NULL) == -1) {
+            if(execl(program, program, program_args, routekey, tempfile, messageid , header_to_program_value?header_to_program_value:"", correlationid,NULL) == -1) {
               perror("Could not execute program");
               exit(EXIT_FAILURE);
             }
@@ -498,7 +533,11 @@ int main(int argc, char **argv) {
           fflush(stdout);
         }
         free(routekey);
+        free(messageid);
+        free(correlationid);
       }
+
+	  if(header_to_program_value) free(header_to_program_value);
 
       // send ack on successful processing of the frame
       if((0 == status) && (0 == no_ack))

@@ -128,6 +128,10 @@ void print_help(const char *program_name) {
     fprintf(stderr, "  --password/-p password specify password (default: \"guest\")\n");
     fprintf(stderr, "  --persistent           mark message as persistent\n");
     fprintf(stderr, "  --no-persistent        mark message as not persistent\n");
+    fprintf(stderr, "  --content-type/-t      content_type property\n");
+    fprintf(stderr, "  --message-id/-m msg    message_id property\n");
+    fprintf(stderr, "  --correlation-id/-c    correlation_id property\n");
+    fprintf(stderr, "  --header/-H name=val   addtition message header (name=value)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "The following environment variables may also be set:\n");
     fprintf(stderr, "  AMQP_HOST, AMQP_PORT, AMQP_VHOST, AMQP_USER, AMQP_PASSWORD, AMQP_PERSISTENT\n");
@@ -191,6 +195,10 @@ int main(int argc, char **argv) {
   char const *username = "guest";
   char const *password = "guest";
   char const *filename = NULL;
+  char const *content_type = NULL;
+  char const *messageid = NULL;
+  char const *correlationid = NULL;
+  char const *custom_header=NULL;
   amqp_bytes_t messagebody;
 
   int sockfd;
@@ -211,6 +219,8 @@ int main(int argc, char **argv) {
     password = getenv("AMQP_PASSWORD");
   if (NULL != getenv("AMQP_PERSISTENT"))
     persistent = atoi(getenv("AMQP_PERSISTENT"));
+  if (NULL != getenv("AMQP_CUSTOM_HEADER"))
+    custom_header = getenv("AMQP_CUSTOM_HEADER");
 
   while(1) {
     static struct option long_options[] =
@@ -224,11 +234,15 @@ int main(int argc, char **argv) {
       {"file", required_argument, 0, 'f'},
       {"persistent", no_argument, &persistent, 2},
       {"no-persistent", no_argument, &persistent, 1},
+      {"content-type", required_argument, 0, 't'},
+      {"message-id", required_argument, 0, 'm'},
+      {"correlation-id", required_argument, 0, 'c'},
+      {"header", required_argument, 0, 'H'},
       {"help", no_argument, 0, '?'},
       {0, 0, 0, 0}
     };
     int option_index = 0;
-    c = getopt_long(argc, argv, "v:h:P:u:p:f:?",
+    c = getopt_long(argc, argv, "v:h:P:u:p:f:t:m:c:H:?",
                     long_options, &option_index);
     if(c == -1)
       break;
@@ -255,6 +269,19 @@ int main(int argc, char **argv) {
       case 'p':
         password = optarg;
         break;
+      case 't':
+        content_type = optarg;
+        break;
+      case 'm':
+        messageid = optarg;
+        break;
+      case 'c':
+        correlationid = optarg;
+        break;
+      case 'H':
+        custom_header = optarg;
+        break;
+
       case '?':
       default:
         print_help(argv[0]);
@@ -312,7 +339,48 @@ int main(int argc, char **argv) {
   {
     amqp_basic_properties_t props;
     props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG | AMQP_BASIC_DELIVERY_MODE_FLAG;
-    props.content_type = amqp_cstring_bytes("text/plain");
+    props.content_type = amqp_cstring_bytes( content_type != NULL ? content_type : "text/plain" );
+
+    if(messageid!=NULL)  
+    {
+     props._flags |=AMQP_BASIC_MESSAGE_ID_FLAG;
+	 props.message_id = amqp_cstring_bytes(messageid);
+	}
+    if(correlationid!=NULL)
+    {
+	 props._flags |=AMQP_BASIC_CORRELATION_ID_FLAG;
+     props.correlation_id = amqp_cstring_bytes(correlationid);
+    }
+
+	amqp_table_entry_t* pEntry = NULL;
+	char* pos_equal=NULL;
+   	if(custom_header!=NULL && (pos_equal=strstr(custom_header,"=")) != NULL) 
+   {
+	   props._flags |= AMQP_BASIC_HEADERS_FLAG;
+	   *pos_equal='\0';
+	   char* header_value=pos_equal+1;
+	   char* header_value_end=header_value+strlen(header_value)-1;
+	   if(*header_value == '\"' && *(header_value+strlen(header_value)-1)=='\"' ) 
+	   {
+          header_value[strlen(header_value)-1]='\0';
+		  header_value++;
+	   }	 
+
+	   if(props.headers.num_entries > 0)
+       {
+	     pEntry = (amqp_table_entry_t*) calloc(1, sizeof(amqp_table_entry_t));
+	   } 
+       else 
+       {
+         pEntry = (amqp_table_entry_t*) realloc(props.headers.entries, (props.headers.num_entries+1) * sizeof(amqp_table_entry_t));
+       }	
+	   props.headers.entries=pEntry;
+	   props.headers.num_entries++;
+	   pEntry->key=amqp_cstring_bytes(custom_header);
+	   pEntry->value.kind=AMQP_FIELD_KIND_UTF8;
+	   pEntry->value.value.bytes = amqp_cstring_bytes(header_value);
+    }	
+
     props.delivery_mode = persistent; // persistent delivery mode
     die_on_error(amqp_basic_publish(conn,
                                     1,
@@ -323,10 +391,13 @@ int main(int argc, char **argv) {
                                     &props,
                                     messagebody),
                  "Sending message");
+
+	if(pEntry !=NULL) free(pEntry);
   }
 
   if(NULL != filename) // he who allocates, shall free
     free(messagebody.bytes);
+
   die_on_amqp_error(amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS),
                     "Closing channel");
   die_on_amqp_error(amqp_connection_close(conn, AMQP_REPLY_SUCCESS),
